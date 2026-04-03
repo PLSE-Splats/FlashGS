@@ -1,4 +1,7 @@
 numpy==1.26.4
 torch
+torchvision
+torchmetrics
 pybind11
 setuptools
+Pillow
