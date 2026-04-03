@@ -10,3 +10,4 @@ venv/
 *.jpeg
 *.json
 *.ply
+*.csv
