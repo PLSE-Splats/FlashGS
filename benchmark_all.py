@@ -237,8 +237,10 @@ def benchmark_model(model_path):
     gt_output_dir = os.path.join(quality_output_dir, "gt")
     device = torch.device("cuda:0")
     bg_color = torch.zeros(3, dtype=torch.float32)  # black
-    render_scale = 0.5 if model_name in MID_RES_RENDER_MODELS else (
-        1.0 if model_name in LOW_RES_GT_MODELS else 0.25
+    render_scale = (
+        0.5
+        if model_name in MID_RES_RENDER_MODELS
+        else (1.0 if model_name in LOW_RES_GT_MODELS else 0.25)
     )
 
     scene = Scene(device)
@@ -255,27 +257,22 @@ def benchmark_model(model_path):
     MAX_NUM_RENDERED = 2**27
     MAX_NUM_TILES = 2**20
     rasterizer = Rasterizer(scene, MAX_NUM_RENDERED, MAX_NUM_TILES)
-    fps_values = []
 
-    for warmup in range(2):
-        if warmup == 0:
-            print("Warmup...")
-        else:
-            print("Actual...")
-        for _ in range(200):
-            for i, camera in enumerate(cameras):
-                if warmup == 0:
-                    image = rasterizer.forward(scene, camera, bg_color)  # warm up
-                else:
-                    torch.cuda.synchronize()
-                    t0 = time.time()
-                    image = rasterizer.forward(scene, camera, bg_color)
-                    torch.cuda.synchronize()
-                    t1 = time.time()
+    print("Warmup...")
+    for _ in range(200):
+        for _, camera in enumerate(cameras):
+            _ = rasterizer.forward(scene, camera, bg_color)  # warm up
 
-                    fps_values.append(1 / (t1 - t0))
+    print("Actual...")
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(200):
+        for _, camera in enumerate(cameras):
+            _ = rasterizer.forward(scene, camera, bg_color)
+    torch.cuda.synchronize()
+    t1 = time.perf_counter()
 
-    average_fps = sum(fps_values) / len(fps_values) if fps_values else 0.0
+    average_fps = (200 * len(cameras)) / (t1 - t0)
     psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
     ssim_metric = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
     lpips_metric = LearnedPerceptualImagePatchSimilarity(
@@ -287,7 +284,9 @@ def benchmark_model(model_path):
     with torch.inference_mode():
         for camera in cameras:
             rendered_image = rasterizer.forward(scene, camera, bg_color)
-            savePpm(rendered_image, os.path.join(test_output_dir, f"{camera.img_name}.ppm"))
+            savePpm(
+                rendered_image, os.path.join(test_output_dir, f"{camera.img_name}.ppm")
+            )
             rendered_image = rendered_image_to_float(rendered_image).unsqueeze(0)
             ground_truth_path = resolve_ground_truth_image_path(
                 gt_image_dir, camera.img_name
