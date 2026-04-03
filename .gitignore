@@ -2,6 +2,7 @@ build/
 .idea/
 flash_gaussian_splatting.egg-info/
 dist/
+venv/
 
 *.ppm
 *.png
