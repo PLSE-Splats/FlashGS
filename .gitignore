@@ -11,3 +11,4 @@ venv/
 *.json
 *.ply
 *.csv
+/__pycache__

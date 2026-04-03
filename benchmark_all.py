@@ -1,11 +1,27 @@
-import torch
-import flash_gaussian_splatting
-
 import csv
+import math
 import os
 import sys
 import json
 import time
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+import torch
+import flash_gaussian_splatting
+from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+
+
+SOURCE_ROOT = Path("/home/kenneth/Documents/3dgs_models/Source")
+LOW_RES_GT_MODELS = {"drjohnson", "playroom", "train", "truck"}
+MID_RES_RENDER_MODELS = {"train", "truck"}
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+
+
+def round_half_up(value):
+    return int(math.floor(value + 0.5))
 
 
 class Scene:
@@ -32,8 +48,8 @@ class Camera:
     def __init__(self, camera_json, render_scale=1.0):
         self.id = camera_json["id"]
         self.img_name = camera_json["img_name"]
-        self.width = max(1, int(round(camera_json["width"] * render_scale)))
-        self.height = max(1, int(round(camera_json["height"] * render_scale)))
+        self.width = max(1, round_half_up(camera_json["width"] * render_scale))
+        self.height = max(1, round_half_up(camera_json["height"] * render_scale))
         self.position = torch.tensor(camera_json["position"])
         self.rotation = torch.tensor(camera_json["rotation"])
         self.focal_x = camera_json["fx"] * render_scale
@@ -149,6 +165,49 @@ class Rasterizer:
         return out_color
 
 
+def image_to_tensor(image):
+    return torch.from_numpy(np.asarray(image, dtype=np.uint8).copy())
+
+
+def rendered_image_to_float(image):
+    return image.to(torch.uint8).permute(2, 0, 1).contiguous().float().div_(255.0)
+
+
+def load_ground_truth_image(image_path, width, height, device):
+    image = Image.open(image_path).convert("RGB")
+    if image.size != (width, height):
+        raise ValueError(
+            f"Ground truth image {image_path} has size {image.size}, expected {(width, height)}"
+        )
+    return (
+        image_to_tensor(image)
+        .to(device)
+        .permute(2, 0, 1)
+        .contiguous()
+        .float()
+        .div_(255.0)
+    )
+
+
+def resolve_ground_truth_image_path(image_dir, img_name):
+    direct_path = image_dir / img_name
+    if direct_path.is_file():
+        return direct_path
+
+    for extension in IMAGE_EXTENSIONS:
+        candidate = image_dir / f"{img_name}{extension}"
+        if candidate.is_file():
+            return candidate
+
+    matches = sorted(image_dir.glob(f"{img_name}.*"))
+    if matches:
+        return matches[0]
+
+    raise FileNotFoundError(
+        f"Could not find ground truth image for {img_name} in {image_dir}"
+    )
+
+
 def savePpm(image, path):
     image = image.cpu()
     assert image.dim() >= 3
@@ -163,13 +222,24 @@ def savePpm(image, path):
 
 def benchmark_model(model_path):
     print(f"Benchmarking {model_path}")
+    model_name = os.path.basename(os.path.normpath(model_path))
     scene_path = os.path.join(
         model_path, "point_cloud", "iteration_30000", "point_cloud.ply"
     )
     camera_path = os.path.join(model_path, "cameras.json")
+    gt_image_dir = (
+        SOURCE_ROOT
+        / model_name
+        / ("images" if model_name in LOW_RES_GT_MODELS else "images_4")
+    )
+    quality_output_dir = os.path.join(model_path, "quality_test")
+    test_output_dir = os.path.join(quality_output_dir, "test")
+    gt_output_dir = os.path.join(quality_output_dir, "gt")
     device = torch.device("cuda:0")
     bg_color = torch.zeros(3, dtype=torch.float32)  # black
-    render_scale = 0.25
+    render_scale = 0.5 if model_name in MID_RES_RENDER_MODELS else (
+        1.0 if model_name in LOW_RES_GT_MODELS else 0.25
+    )
 
     scene = Scene(device)
     scene.loadPly(scene_path)
@@ -206,14 +276,54 @@ def benchmark_model(model_path):
                     fps_values.append(1 / (t1 - t0))
 
     average_fps = sum(fps_values) / len(fps_values) if fps_values else 0.0
-    return average_fps
+    psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
+    ssim_metric = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
+    lpips_metric = LearnedPerceptualImagePatchSimilarity(
+        net_type="vgg", normalize=True
+    ).to(device)
+
+    os.makedirs(test_output_dir, exist_ok=True)
+    os.makedirs(gt_output_dir, exist_ok=True)
+    with torch.inference_mode():
+        for camera in cameras:
+            rendered_image = rasterizer.forward(scene, camera, bg_color)
+            savePpm(rendered_image, os.path.join(test_output_dir, f"{camera.img_name}.ppm"))
+            rendered_image = rendered_image_to_float(rendered_image).unsqueeze(0)
+            ground_truth_path = resolve_ground_truth_image_path(
+                gt_image_dir, camera.img_name
+            )
+            ground_truth_image = load_ground_truth_image(
+                ground_truth_path, camera.width, camera.height, device
+            ).unsqueeze(0)
+            with Image.open(ground_truth_path) as ground_truth_image_file:
+                ground_truth_image_file.convert("RGB").save(
+                    os.path.join(gt_output_dir, f"{camera.img_name}.png")
+                )
+
+            psnr_metric.update(rendered_image, ground_truth_image)
+            ssim_metric.update(rendered_image, ground_truth_image)
+            lpips_metric.update(rendered_image, ground_truth_image)
+
+    return average_fps, {
+        "psnr": float(psnr_metric.compute().item()),
+        "ssim": float(ssim_metric.compute().item()),
+        "lpips": float(lpips_metric.compute().item()),
+    }
 
 
-def append_model_fps(model_path, fps, csv_path="all_fps.csv"):
+def append_model_metrics(model_path, fps, metrics, csv_path="all_fps.csv"):
     model_name = os.path.basename(os.path.normpath(model_path))
     with open(csv_path, "a", newline="") as csv_file:
         writer = csv.writer(csv_file)
-        writer.writerow([model_name, fps])
+        writer.writerow(
+            [
+                model_name,
+                fps,
+                metrics["psnr"],
+                metrics["ssim"],
+                metrics["lpips"],
+            ]
+        )
 
 
 def iter_model_paths(models_path):
@@ -235,6 +345,6 @@ if __name__ == "__main__":
         models_path = "/home/kenneth/Documents/3dgs_models/models"  # https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/pretrained/models.zip
 
     for model_path in iter_model_paths(models_path):
-        average_fps = benchmark_model(model_path)
-        print(f"{model_path}: {average_fps}\n")
-        append_model_fps(model_path, average_fps)
+        average_fps, metrics = benchmark_model(model_path)
+        print(f"{model_path}: {average_fps}, {metrics}\n")
+        append_model_metrics(model_path, average_fps, metrics)
