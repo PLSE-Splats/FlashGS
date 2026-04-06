@@ -14,7 +14,7 @@ from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMe
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 
-SOURCE_ROOT = Path("/home/kenneth/Documents/3dgs_models/Source")
+SOURCE_ROOT = Path("/home/kenneth/Documents/3dgs_models/source")
 LOW_RES_GT_MODELS = {"drjohnson", "playroom", "train", "truck"}
 MID_RES_RENDER_MODELS = {"train", "truck"}
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
@@ -341,7 +341,7 @@ if __name__ == "__main__":
     if len(sys.argv) >= 2:
         models_path = sys.argv[1]
     else:
-        models_path = "/home/kenneth/Documents/3dgs_models/models"  # https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/pretrained/models.zip
+        models_path = "/home/kenneth/Documents/3dgs_models/faster"  # https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/pretrained/models.zip
 
     for model_path in iter_model_paths(models_path):
         average_fps, metrics = benchmark_model(model_path)
